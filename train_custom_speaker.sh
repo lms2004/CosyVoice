@@ -1,10 +1,66 @@
 #!/bin/bash
 # 单一说话人适配脚本 - 符合CosyVoice2官方流程
 
-# 设置路径
+#=====================================================================
+# 配置区域 - 所有可自定义参数集中在此处
+#=====================================================================
+
+# 1. 基本路径配置
+#---------------------------------------------------------------------
+# 预训练模型目录
 pretrained_model_dir=/mnt/c/Users/lms/Desktop/CosyVoice/pretrained_models/CosyVoice2-0.5B
-custom_data_dir=/path/to/your/mp3/files  # 修改为您的MP3文件目录
-output_dir=/mnt/c/Users/lms/Desktop/CosyVoice/custom_speaker_model  # 输出目录
+# 输出目录
+output_dir=/mnt/c/Users/lms/Desktop/CosyVoice/custom_speaker_model
+
+# 2. 数据目录配置
+#---------------------------------------------------------------------
+# 原始MP3文件目录
+custom_data_dir=./asset/mp3s
+# 拆分后的音频文件目录
+split_data_dir=./asset/split_mp3s/wavs
+# 拆分后的文本转录目录
+transcript_dir=./asset/split_mp3s/transcripts
+# 说话人ID
+speaker_id=my_tts
+
+# 3. 训练控制参数
+#---------------------------------------------------------------------
+# 阶段控制
+stage=0
+stop_stage=7
+# 是否使用拆分后的数据
+use_split_data=true  # 设置为false则使用原始MP3文件
+
+# 4. GPU和分布式训练配置
+#---------------------------------------------------------------------
+# GPU设置
+export CUDA_VISIBLE_DEVICES="0"  # 根据您的GPU情况调整
+num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
+# 分布式训练参数
+job_id=1234
+dist_backend="nccl"
+num_workers=2
+prefetch=100
+train_engine=torch_ddp
+
+# 5. 模型平均参数
+#---------------------------------------------------------------------
+average_num=5  # 平均最后几个检查点
+
+#=====================================================================
+# 内部变量计算 - 不需要手动修改
+#=====================================================================
+
+# 根据配置决定使用哪个数据目录
+if [ "$use_split_data" = true ] && [ -d "$split_data_dir" ]; then
+  audio_data_dir=$split_data_dir
+  audio_transcript_dir=$transcript_dir
+  echo "使用拆分后的音频数据: $audio_data_dir"
+else
+  audio_data_dir=$custom_data_dir
+  audio_transcript_dir=""
+  echo "使用原始MP3文件: $audio_data_dir"
+fi
 
 # 创建必要的目录
 mkdir -p $output_dir/data
@@ -12,17 +68,28 @@ mkdir -p $output_dir/exp/cosyvoice2
 mkdir -p $output_dir/tensorboard/cosyvoice2
 mkdir -p $output_dir/conf
 
-# 阶段控制
-stage=0
-stop_stage=7
-
 # 1. 数据准备
 if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
   echo "数据准备，生成 wav.scp/text/utt2spk/spk2utt"
-  python /mnt/c/Users/lms/Desktop/CosyVoice/prepare_custom_data.py \
-    --src_dir $custom_data_dir \
-    --des_dir $output_dir/data/custom_speaker \
-    --speaker_id custom_speaker
+  
+  # 准备数据目录
+  mkdir -p $output_dir/data/custom_speaker
+  
+  # 根据是否有单独的文本目录决定命令参数
+  if [ -n "$audio_transcript_dir" ] && [ -d "$audio_transcript_dir" ]; then
+    # 使用单独的文本目录
+    python /mnt/c/Users/lms/Desktop/CosyVoice/prepare_custom_data.py \
+      --src_dir $audio_data_dir \
+      --des_dir $output_dir/data/custom_speaker \
+      --speaker_id $speaker_id \
+      --transcript_dir $audio_transcript_dir
+  else
+    # 使用默认目录结构
+    python /mnt/c/Users/lms/Desktop/CosyVoice/prepare_custom_data.py \
+      --src_dir $audio_data_dir \
+      --des_dir $output_dir/data/custom_speaker \
+      --speaker_id $speaker_id
+  fi
 fi
 
 # 2. 提取说话人嵌入向量
@@ -85,13 +152,7 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
 fi
 
 # 7. 训练模型
-export CUDA_VISIBLE_DEVICES="0"  # 根据您的GPU情况调整
-num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
-job_id=1234
-dist_backend="nccl"
-num_workers=2
-prefetch=100
-train_engine=torch_ddp
+# GPU和分布式训练参数已在配置区域设置
 
 if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
   echo "开始训练模型"
@@ -119,7 +180,7 @@ if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
 fi
 
 # 8. 模型平均
-average_num=5
+# 模型平均参数已在配置区域设置
 if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
   for model in llm flow hifigan; do
     model_dir=$output_dir/exp/cosyvoice2/$model/$train_engine
