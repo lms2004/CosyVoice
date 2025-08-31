@@ -68,6 +68,7 @@ def main():
     parser.add_argument('--num_workers', type=int, default=2, help='并发工作线程数（建议小一些避免限流）')
     parser.add_argument('--overwrite', action='store_true', help='若已存在 .txt 是否覆盖')
     parser.add_argument('--max_retries', type=int, default=3, help='失败重试次数')
+    parser.add_argument('--limit', type=int, default=0, help='仅处理前 N 个文件，0 表示不限制')
     args = parser.parse_args()
 
     ensure_dir(args.out_dir)
@@ -77,6 +78,8 @@ def main():
         os.path.join(args.wav_dir, n) for n in sorted(os.listdir(args.wav_dir))
         if n.lower().endswith('.wav')
     ]
+    if args.limit and args.limit > 0:
+        wavs = wavs[:args.limit]
     if not wavs:
         print(f'未在 {args.wav_dir} 找到 WAV 文件', file=sys.stderr)
         sys.exit(1)
