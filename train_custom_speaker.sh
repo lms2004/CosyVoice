@@ -30,30 +30,37 @@ speaker_id=my_tts
 
 # 3. 训练控制参数
 #---------------------------------------------------------------------
-# 阶段控制
-stage=0
-stop_stage=7
-# 是否使用拆分后的数据
-use_split_data=true  # 设置为false则使用原始MP3文件
+# 阶段控制（支持环境变量覆盖）
+stage="${stage:-0}"
+stop_stage="${stop_stage:-8}"
+# 是否使用拆分后的数据（支持环境变量覆盖）
+use_split_data="${use_split_data:-true}"  # 设置为false则使用原始MP3文件
 
 # 4. GPU和分布式训练配置
 #---------------------------------------------------------------------
-# GPU设置
-export CUDA_VISIBLE_DEVICES="0"  # 根据您的GPU情况调整
-num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
-# 分布式训练参数
-job_id=1234
-dist_backend="nccl"
-num_workers=2
-prefetch=100
-train_engine=torch_ddp
+# GPU设置（支持环境变量覆盖）
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"  # 根据您的GPU情况调整
+num_gpus=$(echo "${CUDA_VISIBLE_DEVICES}" | awk -F "," '{print NF}')
+# 分布式训练参数（支持环境变量覆盖）
+job_id="${job_id:-1234}"
+dist_backend="${dist_backend:-nccl}"
+num_workers="${num_workers:-2}"
+prefetch="${prefetch:-100}"
+train_engine="${train_engine:-torch_ddp}"
+
+# 若 CPU 运行（未指定 GPU），自动切换到 gloo，并将并行卡数设为 1
+if [ -z "${CUDA_VISIBLE_DEVICES}" ]; then
+  dist_backend="gloo"
+  num_gpus=1
+  echo "[INFO] 检测到 CPU 模式，dist_backend=gloo, num_gpus=1"
+fi
 
 # 5. 模型平均参数
 #---------------------------------------------------------------------
 average_num=5  # 平均最后几个检查点
 
-# 6. 训练组件选择（默认先只训练 LLM；如需全部，改为："llm flow hifigan"）
-MODELS="llm"
+# 6. 训练组件选择（支持环境变量覆盖；默认先只训练 LLM；如需全部，改为："llm flow hifigan"）
+MODELS="${MODELS:-llm}"
 
 #=====================================================================
 # 内部变量计算 - 不需要手动修改
@@ -68,6 +75,13 @@ else
   audio_data_dir=$custom_data_dir
   audio_transcript_dir=""
   echo "使用原始MP3文件: $audio_data_dir"
+fi
+
+# 关键路径校验
+test -d "$pretrained_model_dir" || { echo "[ERROR] 预训练模型目录不存在: $pretrained_model_dir"; exit 1; }
+test -d "$audio_data_dir" || { echo "[ERROR] 音频数据目录不存在: $audio_data_dir"; exit 1; }
+if [ -n "$audio_transcript_dir" ]; then
+  test -d "$audio_transcript_dir" || { echo "[ERROR] 文本转录目录不存在: $audio_transcript_dir"; exit 1; }
 fi
 
 # 创建必要的目录
