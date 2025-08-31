@@ -6,6 +6,7 @@ venv
 
 asset/mp3/
 asset
+custom_speaker_model
 
 .env
 
