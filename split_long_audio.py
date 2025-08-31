@@ -31,6 +31,8 @@ def convert_mp3_to_wav(mp3_path, output_dir=None, target_sr=16000):
         
         # 如果指定了输出目录，则保存为WAV文件
         if output_dir:
+            # 确保输出目录存在
+            os.makedirs(output_dir, exist_ok=True)
             basename = os.path.basename(mp3_path)
             wav_name = os.path.splitext(basename)[0] + ".wav"
             wav_path = os.path.join(output_dir, wav_name)
@@ -156,6 +158,9 @@ def main():
     wavs_dir = os.path.join(args.output_dir, 'wavs')
     transcripts_dir = os.path.join(args.output_dir, 'transcripts')
     os.makedirs(wavs_dir, exist_ok=True)
+    # 确保临时目录存在（用于中间WAV存放）
+    temp_dir = os.path.join(args.output_dir, 'temp')
+    os.makedirs(temp_dir, exist_ok=True)
     
     # 获取所有MP3文件
     mp3_files = glob.glob(os.path.join(args.src_dir, '*.mp3'))
@@ -185,7 +190,6 @@ def main():
             all_output_paths.extend(output_paths)
     
     # 清理临时文件
-    temp_dir = os.path.join(args.output_dir, 'temp')
     if os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
     

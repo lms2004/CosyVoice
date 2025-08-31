@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 venv
+asset/mp3/
+.env
+
 # Visual Studio Code files
 .vscode
 .vs
