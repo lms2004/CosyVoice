@@ -1,4 +1,9 @@
 #!/bin/bash
+# 严格模式：任一命令失败立即退出；未定义变量报错；管道失败冒泡
+set -Eeuo pipefail
+
+# 失败时打印出错位置
+trap 'echo "[ERROR] Failed at line $LINENO. Exit." >&2' ERR
 # 单一说话人适配脚本 - 符合CosyVoice2官方流程
 
 #=====================================================================
@@ -14,8 +19,8 @@ output_dir=/mnt/c/Users/lms/Desktop/CosyVoice/custom_speaker_model
 
 # 2. 数据目录配置
 #---------------------------------------------------------------------
-# 原始MP3文件目录
-custom_data_dir=./asset/mp3s
+# 原始MP3文件目录（根据你的数据目录调整）
+custom_data_dir=./asset/mp3
 # 拆分后的音频文件目录
 split_data_dir=./asset/split_mp3s/wavs
 # 拆分后的文本转录目录
@@ -47,6 +52,9 @@ train_engine=torch_ddp
 #---------------------------------------------------------------------
 average_num=5  # 平均最后几个检查点
 
+# 6. 训练组件选择（默认先只训练 LLM；如需全部，改为："llm flow hifigan"）
+MODELS="llm"
+
 #=====================================================================
 # 内部变量计算 - 不需要手动修改
 #=====================================================================
@@ -74,7 +82,14 @@ if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
   
   # 准备数据目录
   mkdir -p $output_dir/data/custom_speaker
-  
+  # 已完成检测（四个Kaldi文件）
+  if [ -s "$output_dir/data/custom_speaker/wav.scp" ] \
+    && [ -s "$output_dir/data/custom_speaker/text" ] \
+    && [ -s "$output_dir/data/custom_speaker/utt2spk" ] \
+    && [ -s "$output_dir/data/custom_speaker/spk2utt" ]; then
+    echo "[SKIP] 已检测到现有 Kaldi 文件，跳过数据准备阶段。"
+  else
+    
   # 根据是否有单独的文本目录决定命令参数
   if [ -n "$audio_transcript_dir" ] && [ -d "$audio_transcript_dir" ]; then
     # 使用单独的文本目录
@@ -90,65 +105,102 @@ if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
       --des_dir $output_dir/data/custom_speaker \
       --speaker_id $speaker_id
   fi
+    
+    # 成功校验
+    for f in wav.scp text utt2spk spk2utt; do
+      test -s "$output_dir/data/custom_speaker/$f" || { echo "[ERROR] 缺少 $f"; exit 1; }
+    done
+    echo "[OK] 数据准备完成。"
+  fi
 fi
 
 # 2. 提取说话人嵌入向量
 if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
   echo "提取说话人嵌入向量"
-  python /mnt/c/Users/lms/Desktop/CosyVoice/tools/extract_embedding.py \
-    --dir $output_dir/data/custom_speaker \
-    --onnx_path $pretrained_model_dir/campplus.onnx
+  # 已完成检测
+  if [ -s "$output_dir/data/custom_speaker/spk2embedding.pt" ] \
+    && [ -s "$output_dir/data/custom_speaker/utt2embedding.pt" ]; then
+    echo "[SKIP] 已检测到 embedding 结果，跳过。"
+  else
+    python /mnt/c/Users/lms/Desktop/CosyVoice/tools/extract_embedding.py \
+      --dir $output_dir/data/custom_speaker \
+      --onnx_path $pretrained_model_dir/campplus.onnx
+    test -s "$output_dir/data/custom_speaker/spk2embedding.pt" || { echo "[ERROR] 缺少 spk2embedding.pt"; exit 1; }
+    test -s "$output_dir/data/custom_speaker/utt2embedding.pt" || { echo "[ERROR] 缺少 utt2embedding.pt"; exit 1; }
+    echo "[OK] 说话人嵌入完成。"
+  fi
 fi
+# 注：以下行可能是误加的外部调用，会中断流程，故注释掉。
+# python3 client.py --port 50000 --mode sft
 
 # 3. 提取离散语音标记
 if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
   echo "提取离散语音标记"
-  python /mnt/c/Users/lms/Desktop/CosyVoice/tools/extract_speech_token.py \
-    --dir $output_dir/data/custom_speaker \
-    --onnx_path $pretrained_model_dir/speech_tokenizer_v2.onnx
+  if [ -s "$output_dir/data/custom_speaker/utt2speech_token.pt" ]; then
+    echo "[SKIP] 已检测到 utt2speech_token.pt，跳过。"
+  else
+    python /mnt/c/Users/lms/Desktop/CosyVoice/tools/extract_speech_token.py \
+      --dir $output_dir/data/custom_speaker \
+      --onnx_path $pretrained_model_dir/speech_tokenizer_v2.onnx
+    test -s "$output_dir/data/custom_speaker/utt2speech_token.pt" || { echo "[ERROR] 缺少 utt2speech_token.pt"; exit 1; }
+    echo "[OK] 语音 token 提取完成。"
+  fi
 fi
 
 # 4. 准备Parquet格式数据
 if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
   echo "准备Parquet格式数据"
   mkdir -p $output_dir/data/custom_speaker/parquet
-  python /mnt/c/Users/lms/Desktop/CosyVoice/tools/make_parquet_list.py \
-    --num_utts_per_parquet 1000 \
-    --num_processes 4 \
-    --src_dir $output_dir/data/custom_speaker \
-    --des_dir $output_dir/data/custom_speaker/parquet
+  if [ -s "$output_dir/data/custom_speaker/parquet/data.list" ]; then
+    echo "[SKIP] 已检测到 parquet/data.list，跳过。"
+  else
+    python /mnt/c/Users/lms/Desktop/CosyVoice/tools/make_parquet_list.py \
+      --num_utts_per_parquet 1000 \
+      --num_processes 4 \
+      --src_dir $output_dir/data/custom_speaker \
+      --des_dir $output_dir/data/custom_speaker/parquet
+    test -s "$output_dir/data/custom_speaker/parquet/data.list" || { echo "[ERROR] 缺少 parquet/data.list"; exit 1; }
+    echo "[OK] Parquet 列表生成完成。"
+  fi
 fi
 
 # 5. 创建训练和验证数据列表
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   echo "创建训练和验证数据列表"
   # 将数据分为训练集和验证集
-  total_files=$(wc -l < $output_dir/data/custom_speaker/parquet/data.list)
-  train_count=$((total_files * 9 / 10))
-  
-  if [ $train_count -lt 1 ]; then
-    train_count=1
-  fi
-  
-  head -n $train_count $output_dir/data/custom_speaker/parquet/data.list > $output_dir/data/train.data.list
-  
-  # 如果有足够的数据，创建验证集，否则使用训练集作为验证集
-  if [ $train_count -lt $total_files ]; then
-    tail -n +$((train_count + 1)) $output_dir/data/custom_speaker/parquet/data.list > $output_dir/data/dev.data.list
+  if [ -s "$output_dir/data/train.data.list" ] && [ -s "$output_dir/data/dev.data.list" ]; then
+    echo "[SKIP] 已检测到 train/dev 列表，跳过。"
   else
-    cp $output_dir/data/train.data.list $output_dir/data/dev.data.list
+    total_files=$(wc -l < $output_dir/data/custom_speaker/parquet/data.list)
+    train_count=$((total_files * 9 / 10))
+    if [ $train_count -lt 1 ]; then
+      train_count=1
+    fi
+    head -n $train_count $output_dir/data/custom_speaker/parquet/data.list > $output_dir/data/train.data.list
+    if [ $train_count -lt $total_files ]; then
+      tail -n +$((train_count + 1)) $output_dir/data/custom_speaker/parquet/data.list > $output_dir/data/dev.data.list
+    else
+      cp $output_dir/data/train.data.list $output_dir/data/dev.data.list
+    fi
+    test -s "$output_dir/data/train.data.list" || { echo "[ERROR] 缺少 train.data.list"; exit 1; }
+    test -s "$output_dir/data/dev.data.list" || { echo "[ERROR] 缺少 dev.data.list"; exit 1; }
+    echo "[OK] 训练/验证列表创建完成。"
   fi
 fi
 
 # 6. 复制并修改配置文件
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   echo "准备配置文件"
-  cp /mnt/c/Users/lms/Desktop/CosyVoice/examples/libritts/cosyvoice2/conf/cosyvoice2.yaml $output_dir/conf/
-  
-  # 修改配置文件中的微调参数
-  sed -i 's/use_spk_embedding: False/use_spk_embedding: True/' $output_dir/conf/cosyvoice2.yaml
-  sed -i 's/lr: 1e-5 # change to 1e-5 during sft/lr: 1e-5/' $output_dir/conf/cosyvoice2.yaml
-  sed -i 's/scheduler: constantlr # change to constantlr during sft/scheduler: constantlr/' $output_dir/conf/cosyvoice2.yaml
+  if [ -s "$output_dir/conf/cosyvoice2.yaml" ]; then
+    echo "[SKIP] 检测到已存在的配置文件，跳过复制与修改。"
+  else
+    cp /mnt/c/Users/lms/Desktop/CosyVoice/examples/libritts/cosyvoice2/conf/cosyvoice2.yaml $output_dir/conf/
+    # 修改配置文件中的微调参数
+    sed -i 's/use_spk_embedding: False/use_spk_embedding: True/' $output_dir/conf/cosyvoice2.yaml || true
+    sed -i 's/lr: 1e-5 # change to 1e-5 during sft/lr: 1e-5/' $output_dir/conf/cosyvoice2.yaml || true
+    sed -i 's/scheduler: constantlr # change to constantlr during sft/scheduler: constantlr/' $output_dir/conf/cosyvoice2.yaml || true
+    test -s "$output_dir/conf/cosyvoice2.yaml" || { echo "[ERROR] 配置文件缺失"; exit 1; }
+  fi
 fi
 
 # 7. 训练模型
@@ -157,8 +209,13 @@ fi
 if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
   echo "开始训练模型"
   
-  # 训练各个模型组件
-  for model in llm flow hifigan; do
+  # 训练所选模型组件
+  for model in $MODELS; do
+    # 如果最终产物已存在则跳过该组件训练
+    if [ -s "$output_dir/exp/cosyvoice2/$model/$train_engine/${model}.pt" ]; then
+      echo "[SKIP] 检测到 $model 已训练完成，跳过。"
+      continue
+    fi
     torchrun --nnodes=1 --nproc_per_node=$num_gpus \
       --rdzv_id=$job_id --rdzv_backend="c10d" --rdzv_endpoint="localhost:1234" \
       /mnt/c/Users/lms/Desktop/CosyVoice/cosyvoice/bin/train.py \
@@ -176,13 +233,14 @@ if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
       --prefetch ${prefetch} \
       --pin_memory \
       --use_amp
+    test -s "$output_dir/exp/cosyvoice2/$model/$train_engine/${model}.pt" || { echo "[ERROR] $model 训练未生成 ${model}.pt"; exit 1; }
   done
 fi
 
 # 8. 模型平均
 # 模型平均参数已在配置区域设置
 if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
-  for model in llm flow hifigan; do
+  for model in $MODELS; do
     model_dir=$output_dir/exp/cosyvoice2/$model/$train_engine
     decode_checkpoint=$model_dir/${model}.pt
     
@@ -202,6 +260,7 @@ if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
     else
       echo "警告: 没有足够的检查点进行平均，跳过模型 $model 的平均步骤"
     fi
+    test -s "$decode_checkpoint" || { echo "[ERROR] $model 平均后未生成 ${model}.pt"; exit 1; }
   done
 fi
 
@@ -212,7 +271,8 @@ if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
   export_dir=$output_dir/exp/export
   mkdir -p $export_dir
   
-  for model in llm flow hifigan; do
+  for model in $MODELS; do
+    
     if [ -f $output_dir/exp/cosyvoice2/$model/$train_engine/${model}.pt ]; then
       cp $output_dir/exp/cosyvoice2/$model/$train_engine/${model}.pt $export_dir/
     else
@@ -221,13 +281,18 @@ if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
   done
   
   # 检查是否所有必要的模型文件都存在
-  if [ -f $export_dir/llm.pt ] && [ -f $export_dir/flow.pt ] && [ -f $export_dir/hifigan.pt ]; then
+  all_present=true
+  for model in $MODELS; do
+    if [ ! -f $export_dir/${model}.pt ]; then all_present=false; fi
+  done
+  if $all_present; then
     # 导出为JIT和ONNX格式
     python /mnt/c/Users/lms/Desktop/CosyVoice/cosyvoice/bin/export_jit.py --model_dir $export_dir
     python /mnt/c/Users/lms/Desktop/CosyVoice/cosyvoice/bin/export_onnx.py --model_dir $export_dir
     echo "模型导出完成，可以在 $export_dir 目录找到导出的模型"
   else
     echo "错误: 缺少必要的模型文件，无法完成导出"
+    exit 1
   fi
 fi
 
