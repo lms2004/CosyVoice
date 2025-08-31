@@ -3,10 +3,8 @@ import argparse
 import os
 import glob
 from tqdm import tqdm
-import torchaudio
-import torch
+import librosa
 import soundfile as sf
-import tempfile
 
 def main():
     parser = argparse.ArgumentParser()
@@ -19,8 +17,10 @@ def main():
     # 创建目标目录
     os.makedirs(args.des_dir, exist_ok=True)
     
-    # 获取所有mp3文件
+    # 获取音频文件（同时支持 mp3 与 wav）
     mp3_files = glob.glob(os.path.join(args.src_dir, '*.mp3'))
+    wav_files = glob.glob(os.path.join(args.src_dir, '*.wav'))
+    audio_files = sorted(mp3_files + wav_files)
     
     # 如果没有指定文本目录，默认使用源目录
     transcript_dir = args.transcript_dir if args.transcript_dir else args.src_dir
@@ -32,10 +32,10 @@ def main():
     wav_dir = os.path.join(args.des_dir, 'wavs')
     os.makedirs(wav_dir, exist_ok=True)
     
-    print(f"处理 {len(mp3_files)} 个MP3文件...")
-    for mp3_path in tqdm(mp3_files):
+    print(f"处理 {len(audio_files)} 个音频文件...")
+    for src_path in tqdm(audio_files):
         # 获取文件名（不含扩展名）
-        basename = os.path.basename(mp3_path)
+        basename = os.path.basename(src_path)
         utt = os.path.splitext(basename)[0]
         utt_id = f"{args.speaker_id}_{utt}"  # 添加说话人前缀，确保唯一ID
         
@@ -49,23 +49,13 @@ def main():
         with open(txt_path, 'r', encoding='utf-8') as f:
             content = f.read().strip()
         
-        # 转换MP3到WAV (16kHz, 单声道)
+        # 统一转换/重采样到 WAV (16kHz, 单声道)
         wav_path = os.path.join(wav_dir, f"{utt}.wav")
         try:
-            # 加载MP3文件
-            waveform, sample_rate = torchaudio.load(mp3_path)
-            
-            # 转换为单声道
-            if waveform.shape[0] > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
-            
-            # 重采样到16kHz
-            if sample_rate != 16000:
-                resampler = torchaudio.transforms.Resample(sample_rate, 16000)
-                waveform = resampler(waveform)
-            
+            # 使用 librosa 读入，强制单声道、16kHz
+            audio, sr = librosa.load(src_path, sr=16000, mono=True)
             # 保存为WAV
-            sf.write(wav_path, waveform.squeeze().numpy(), 16000)
+            sf.write(wav_path, audio, 16000)
             
             # 添加到字典
             utt2wav[utt_id] = os.path.abspath(wav_path)
@@ -74,7 +64,7 @@ def main():
             spk2utt[args.speaker_id].append(utt_id)
             
         except Exception as e:
-            print(f"处理文件 {mp3_path} 时出错: {e}")
+            print(f"处理文件 {src_path} 时出错: {e}")
             continue
     
     # 写入文件
