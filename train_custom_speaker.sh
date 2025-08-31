@@ -1,0 +1,173 @@
+#!/bin/bash
+# 单一说话人适配脚本 - 符合CosyVoice2官方流程
+
+# 设置路径
+pretrained_model_dir=/mnt/c/Users/lms/Desktop/CosyVoice/pretrained_models/CosyVoice2-0.5B
+custom_data_dir=/path/to/your/mp3/files  # 修改为您的MP3文件目录
+output_dir=/mnt/c/Users/lms/Desktop/CosyVoice/custom_speaker_model  # 输出目录
+
+# 创建必要的目录
+mkdir -p $output_dir/data
+mkdir -p $output_dir/exp/cosyvoice2
+mkdir -p $output_dir/tensorboard/cosyvoice2
+mkdir -p $output_dir/conf
+
+# 阶段控制
+stage=0
+stop_stage=7
+
+# 1. 数据准备
+if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
+  echo "数据准备，生成 wav.scp/text/utt2spk/spk2utt"
+  python /mnt/c/Users/lms/Desktop/CosyVoice/prepare_custom_data.py \
+    --src_dir $custom_data_dir \
+    --des_dir $output_dir/data/custom_speaker \
+    --speaker_id custom_speaker
+fi
+
+# 2. 提取说话人嵌入向量
+if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
+  echo "提取说话人嵌入向量"
+  python /mnt/c/Users/lms/Desktop/CosyVoice/tools/extract_embedding.py \
+    --dir $output_dir/data/custom_speaker \
+    --onnx_path $pretrained_model_dir/campplus.onnx
+fi
+
+# 3. 提取离散语音标记
+if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
+  echo "提取离散语音标记"
+  python /mnt/c/Users/lms/Desktop/CosyVoice/tools/extract_speech_token.py \
+    --dir $output_dir/data/custom_speaker \
+    --onnx_path $pretrained_model_dir/speech_tokenizer_v2.onnx
+fi
+
+# 4. 准备Parquet格式数据
+if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
+  echo "准备Parquet格式数据"
+  mkdir -p $output_dir/data/custom_speaker/parquet
+  python /mnt/c/Users/lms/Desktop/CosyVoice/tools/make_parquet_list.py \
+    --num_utts_per_parquet 1000 \
+    --num_processes 4 \
+    --src_dir $output_dir/data/custom_speaker \
+    --des_dir $output_dir/data/custom_speaker/parquet
+fi
+
+# 5. 创建训练和验证数据列表
+if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
+  echo "创建训练和验证数据列表"
+  # 将数据分为训练集和验证集
+  total_files=$(wc -l < $output_dir/data/custom_speaker/parquet/data.list)
+  train_count=$((total_files * 9 / 10))
+  
+  if [ $train_count -lt 1 ]; then
+    train_count=1
+  fi
+  
+  head -n $train_count $output_dir/data/custom_speaker/parquet/data.list > $output_dir/data/train.data.list
+  
+  # 如果有足够的数据，创建验证集，否则使用训练集作为验证集
+  if [ $train_count -lt $total_files ]; then
+    tail -n +$((train_count + 1)) $output_dir/data/custom_speaker/parquet/data.list > $output_dir/data/dev.data.list
+  else
+    cp $output_dir/data/train.data.list $output_dir/data/dev.data.list
+  fi
+fi
+
+# 6. 复制并修改配置文件
+if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
+  echo "准备配置文件"
+  cp /mnt/c/Users/lms/Desktop/CosyVoice/examples/libritts/cosyvoice2/conf/cosyvoice2.yaml $output_dir/conf/
+  
+  # 修改配置文件中的微调参数
+  sed -i 's/use_spk_embedding: False/use_spk_embedding: True/' $output_dir/conf/cosyvoice2.yaml
+  sed -i 's/lr: 1e-5 # change to 1e-5 during sft/lr: 1e-5/' $output_dir/conf/cosyvoice2.yaml
+  sed -i 's/scheduler: constantlr # change to constantlr during sft/scheduler: constantlr/' $output_dir/conf/cosyvoice2.yaml
+fi
+
+# 7. 训练模型
+export CUDA_VISIBLE_DEVICES="0"  # 根据您的GPU情况调整
+num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
+job_id=1234
+dist_backend="nccl"
+num_workers=2
+prefetch=100
+train_engine=torch_ddp
+
+if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
+  echo "开始训练模型"
+  
+  # 训练各个模型组件
+  for model in llm flow hifigan; do
+    torchrun --nnodes=1 --nproc_per_node=$num_gpus \
+      --rdzv_id=$job_id --rdzv_backend="c10d" --rdzv_endpoint="localhost:1234" \
+      /mnt/c/Users/lms/Desktop/CosyVoice/cosyvoice/bin/train.py \
+      --train_engine $train_engine \
+      --config $output_dir/conf/cosyvoice2.yaml \
+      --train_data $output_dir/data/train.data.list \
+      --cv_data $output_dir/data/dev.data.list \
+      --qwen_pretrain_path $pretrained_model_dir/CosyVoice-BlankEN \
+      --model $model \
+      --checkpoint $pretrained_model_dir/$model.pt \
+      --model_dir $output_dir/exp/cosyvoice2/$model/$train_engine \
+      --tensorboard_dir $output_dir/tensorboard/cosyvoice2/$model/$train_engine \
+      --ddp.dist_backend $dist_backend \
+      --num_workers ${num_workers} \
+      --prefetch ${prefetch} \
+      --pin_memory \
+      --use_amp
+  done
+fi
+
+# 8. 模型平均
+average_num=5
+if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
+  for model in llm flow hifigan; do
+    model_dir=$output_dir/exp/cosyvoice2/$model/$train_engine
+    decode_checkpoint=$model_dir/${model}.pt
+    
+    # 检查是否有足够的检查点进行平均
+    checkpoint_count=$(ls -1 $model_dir/checkpoint_*.pt 2>/dev/null | wc -l)
+    if [ $checkpoint_count -lt $average_num ]; then
+      average_num=$checkpoint_count
+    fi
+    
+    if [ $average_num -gt 0 ]; then
+      echo "执行模型平均，最终检查点为 $decode_checkpoint"
+      python /mnt/c/Users/lms/Desktop/CosyVoice/cosyvoice/bin/average_model.py \
+        --dst_model $decode_checkpoint \
+        --src_path $model_dir \
+        --num ${average_num} \
+        --val_best
+    else
+      echo "警告: 没有足够的检查点进行平均，跳过模型 $model 的平均步骤"
+    fi
+  done
+fi
+
+# 9. 导出模型
+if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
+  echo "导出模型以加速推理"
+  # 将训练好的模型复制到一个目录
+  export_dir=$output_dir/exp/export
+  mkdir -p $export_dir
+  
+  for model in llm flow hifigan; do
+    if [ -f $output_dir/exp/cosyvoice2/$model/$train_engine/${model}.pt ]; then
+      cp $output_dir/exp/cosyvoice2/$model/$train_engine/${model}.pt $export_dir/
+    else
+      echo "警告: 模型文件 $model.pt 不存在，无法导出"
+    fi
+  done
+  
+  # 检查是否所有必要的模型文件都存在
+  if [ -f $export_dir/llm.pt ] && [ -f $export_dir/flow.pt ] && [ -f $export_dir/hifigan.pt ]; then
+    # 导出为JIT和ONNX格式
+    python /mnt/c/Users/lms/Desktop/CosyVoice/cosyvoice/bin/export_jit.py --model_dir $export_dir
+    python /mnt/c/Users/lms/Desktop/CosyVoice/cosyvoice/bin/export_onnx.py --model_dir $export_dir
+    echo "模型导出完成，可以在 $export_dir 目录找到导出的模型"
+  else
+    echo "错误: 缺少必要的模型文件，无法完成导出"
+  fi
+fi
+
+echo "训练流程完成！"
